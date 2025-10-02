@@ -1,108 +1,128 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
+#include "hardware/adc.h"
 #include "hardware/gpio.h"
 #include "pico/time.h"
 
-// Motor pins (adjust to your driver wiring)
-#define PWM_LEFT   6
-#define PWM_RIGHT  7
-#define L_IN1      8
-#define L_IN2      9
-#define R_IN3      10
-#define R_IN4      11
+// ---------------- Motor pins ----------------
+#define M1A 8   // Motor 1 forward
+#define M1B 9   // Motor 1 backward
+#define M2A 10  // Motor 2 forward
+#define M2B 11  // Motor 2 backward
 
-// Encoder input (single channel demo)
-#define ENC_PIN    14
+// ---------------- Encoder pins ----------------
+#define ENC1_DIG 6     // Motor 1 encoder digital
+#define ENC1_ADC 26    // Motor 1 encoder analog (ADC0)
+#define ENC2_DIG 4     // Motor 2 encoder digital
+#define ENC2_DIG_B 5   // (optional second channel if available)
 
-static volatile uint32_t last_rise_us = 0;
-static volatile uint32_t last_fall_us = 0;
-static volatile uint32_t high_us = 0;   // last measured high pulse width
-static volatile uint32_t period_us = 0; // last measured period (rise to rise)
+// ---------------- PWM config ----------------
+#define F_PWM_HZ 20000.0f
+#define SYS_CLK_HZ 125000000u
 
-void enc_isr(uint gpio, uint32_t events) {
-    uint32_t now = time_us_32();
+// ---------------- Encoder state ----------------
+static volatile uint32_t enc1_last_rise=0, enc1_period=0, enc1_high=0;
+static volatile uint32_t enc2_last_rise=0, enc2_period=0, enc2_high=0;
+
+static inline uint32_t now_us(void){ return time_us_32(); }
+
+void enc1_isr(uint gpio, uint32_t events){
+    uint32_t t = now_us();
     if (events & GPIO_IRQ_EDGE_RISE) {
-        if (last_rise_us) period_us = now - last_rise_us;
-        last_rise_us = now;
+        if (enc1_last_rise) enc1_period = t - enc1_last_rise;
+        enc1_last_rise = t;
     }
     if (events & GPIO_IRQ_EDGE_FALL) {
-        last_fall_us = now;
-        if (last_rise_us) high_us = last_fall_us - last_rise_us;
+        if (enc1_last_rise) enc1_high = t - enc1_last_rise;
     }
 }
 
-static void pwm_init_pin(uint pin, float freq_hz) {
+void enc2_isr(uint gpio, uint32_t events){
+    uint32_t t = now_us();
+    if (events & GPIO_IRQ_EDGE_RISE) {
+        if (enc2_last_rise) enc2_period = t - enc2_last_rise;
+        enc2_last_rise = t;
+    }
+    if (events & GPIO_IRQ_EDGE_FALL) {
+        if (enc2_last_rise) enc2_high = t - enc2_last_rise;
+    }
+}
+
+// ---------------- PWM helpers ----------------
+static void setup_pwm(uint pin, float freq_hz){
     gpio_set_function(pin, GPIO_FUNC_PWM);
     uint slice = pwm_gpio_to_slice_num(pin);
-    // target ~20 kHz PWM
-    if (freq_hz <= 0) freq_hz = 20000.0f;
-    uint32_t f_sys = 125000000;
-    uint32_t wrap = 9999; // simple config
-    float div = (float)f_sys / (freq_hz * (wrap + 1));
+    uint32_t wrap = 9999;
+    float div = (float)SYS_CLK_HZ / (freq_hz * (wrap + 1));
     pwm_set_clkdiv(slice, div);
     pwm_set_wrap(slice, wrap);
     pwm_set_gpio_level(pin, 0);
     pwm_set_enabled(slice, true);
 }
 
-static void motor_set(float left_pct, float right_pct) {
-    // clamp
-    if (left_pct > 100) left_pct = 100; if (left_pct < -100) left_pct = -100;
-    if (right_pct > 100) right_pct = 100; if (right_pct < -100) right_pct = -100;
-
-    // Direction
-    bool l_fwd = left_pct >= 0;
-    bool r_fwd = right_pct >= 0;
-
-    gpio_put(L_IN1, l_fwd); gpio_put(L_IN2, !l_fwd);
-    gpio_put(R_IN3, r_fwd); gpio_put(R_IN4, !r_fwd);
-
-    // Duty
-    uint sliceL = pwm_gpio_to_slice_num(PWM_LEFT);
-    uint sliceR = pwm_gpio_to_slice_num(PWM_RIGHT);
-    uint32_t wrap = pwm_hw->slice[sliceL].top; // same wrap used
-    uint16_t l = (uint16_t)(wrap * (float) ( (l_fwd? left_pct : -left_pct) / 100.0f ));
-    uint16_t r = (uint16_t)(wrap * (float) ( (r_fwd? right_pct : -right_pct) / 100.0f ));
-    pwm_set_gpio_level(PWM_LEFT, l);
-    pwm_set_gpio_level(PWM_RIGHT, r);
+static inline void set_pwm_pct(uint pin, float pct){
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    uint slice = pwm_gpio_to_slice_num(pin);
+    uint32_t top = pwm_hw->slice[slice].top;
+    pwm_set_gpio_level(pin, (uint16_t)((pct/100.0f) * (top + 1)));
 }
 
-int main() {
+// ---------------- Motor control ----------------
+static void motor1_forward(float pct){ set_pwm_pct(M1A, pct); set_pwm_pct(M1B, 0); }
+static void motor1_backward(float pct){ set_pwm_pct(M1A, 0); set_pwm_pct(M1B, pct); }
+static void motor2_forward(float pct){ set_pwm_pct(M2A, pct); set_pwm_pct(M2B, 0); }
+static void motor2_backward(float pct){ set_pwm_pct(M2A, 0); set_pwm_pct(M2B, pct); }
+static void motors_stop(void){ set_pwm_pct(M1A,0); set_pwm_pct(M1B,0); set_pwm_pct(M2A,0); set_pwm_pct(M2B,0); }
+
+// ---------------- Main ----------------
+int main(){
     stdio_init_all();
     sleep_ms(300);
-    printf("Motor + Encoder demo\n");
+    printf("\n[Motor + Encoder Demo]\n");
 
-    // Direction pins
-    gpio_init(L_IN1); gpio_set_dir(L_IN1, GPIO_OUT);
-    gpio_init(L_IN2); gpio_set_dir(L_IN2, GPIO_OUT);
-    gpio_init(R_IN3); gpio_set_dir(R_IN3, GPIO_OUT);
-    gpio_init(R_IN4); gpio_set_dir(R_IN4, GPIO_OUT);
+    // Init PWM
+    setup_pwm(M1A); setup_pwm(M1B);
+    setup_pwm(M2A); setup_pwm(M2B);
 
-    // PWM pins
-    pwm_init_pin(PWM_LEFT, 20000.0f);
-    pwm_init_pin(PWM_RIGHT, 20000.0f);
+    // Init ADC for IR analog
+    adc_init();
+    adc_gpio_init(ENC1_ADC);   // GP26
 
-    // Encoder input with IRQ on both edges
-    gpio_init(ENC_PIN);
-    gpio_set_dir(ENC_PIN, GPIO_IN);
-    gpio_pull_up(ENC_PIN);
-    gpio_set_irq_enabled_with_callback(ENC_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &enc_isr);
+    // Init encoders digital
+    gpio_init(ENC1_DIG); gpio_set_dir(ENC1_DIG, GPIO_IN); gpio_pull_up(ENC1_DIG);
+    gpio_set_irq_enabled_with_callback(ENC1_DIG, GPIO_IRQ_EDGE_RISE|GPIO_IRQ_EDGE_FALL, true, &enc1_isr);
 
-    // Ramp sequence: CW → stop → CCW
+    gpio_init(ENC2_DIG); gpio_set_dir(ENC2_DIG, GPIO_IN); gpio_pull_up(ENC2_DIG);
+    gpio_set_irq_enabled_with_callback(ENC2_DIG, GPIO_IRQ_EDGE_RISE|GPIO_IRQ_EDGE_FALL, true, &enc2_isr);
+
     while (true) {
-        for (int s = 0; s <= 100; s += 10) {
-            motor_set(s, s);
-            printf("Speed %+3d%% | pulse high=%lu us period=%lu us\n", s, (unsigned long)high_us, (unsigned long)period_us);
-            sleep_ms(500);
+        // Forward sweep
+        printf("Forward sweep\n");
+        for (int s=20; s<=100; s+=20) {
+            motor1_forward((float)s);
+            motor2_forward((float)s);
+            adc_select_input(0);
+            uint16_t ir_val = adc_read();
+            printf("Speed %d%% | ENC1 high=%lu us period=%lu us | ENC2 high=%lu us period=%lu us | IR_ADC=%u\n",
+                   s, enc1_high, enc1_period, enc2_high, enc2_period, ir_val);
+            sleep_ms(1000);
         }
-        motor_set(0,0); sleep_ms(500);
 
-        for (int s = 0; s >= -100; s -= 10) {
-            motor_set(s, s);
-            printf("Speed %+3d%% | pulse high=%lu us period=%lu us\n", s, (unsigned long)high_us, (unsigned long)period_us);
-            sleep_ms(500);
+        motors_stop(); sleep_ms(1500);
+
+        // Backward sweep
+        printf("Backward sweep\n");
+        for (int s=20; s<=100; s+=20) {
+            motor1_backward((float)s);
+            motor2_backward((float)s);
+            adc_select_input(0);
+            uint16_t ir_val = adc_read();
+            printf("Speed %d%% | ENC1 high=%lu us period=%lu us | ENC2 high=%lu us period=%lu us | IR_ADC=%u\n",
+                   s, enc1_high, enc1_period, enc2_high, enc2_period, ir_val);
+            sleep_ms(1000);
         }
-        motor_set(0,0); sleep_ms(1000);
+
+        motors_stop(); sleep_ms(2000);
     }
 }
