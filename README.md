@@ -1,4 +1,4 @@
-# Week 6 Driver Demo: Quick Start
+# Read Me
 
 Targets (build outputs):
 - wifi_echo: UDP echo server (send/receive bytes)
@@ -20,14 +20,9 @@ Build
    - Replug normally (do not hold BOOTSEL).
    - Open Serial Monitor @115200.
 
-Evidence to capture for demo
+Demo
 - wifi_echo: show Pico IP and netcat session sending/receiving a byte.
 - motor_encoder_demo: serial logs showing speed steps and encoder pulse width (us), both CW/CCW.
 - ir_adc_demo: ADC raw values and BLACK/WHITE labels (hold sensor over line/white).
 - imu_raw_demo: streaming accel readings.
 - ultra_servo_demo: servo angle and distance (mm) as it sweeps.
-
-Safety
-- Common ground across all devices.
-- Do NOT feed 5V signals into Pico GPIO. Level-shift HC-SR04 ECHO to 3.3V.
-- Power servo from external 5V, not from Pico 3v3. Share grounds.
